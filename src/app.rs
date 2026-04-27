@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 
 use crate::engine::converter;
 
@@ -61,6 +64,8 @@ pub struct ClickAreas {
     pub content_area: Rect,
     pub optimize_button: Rect,
     pub restructure_button: Rect,
+    pub popup_yes: Rect,
+    pub popup_no: Rect,
 }
 
 /// Progress state for long-running operations
@@ -78,6 +83,29 @@ pub struct ProgressState {
 pub struct Popup {
     pub title: String,
     pub lines: Vec<String>,
+    pub kind: PopupKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum PopupKind {
+    /// Dismiss on any key/click.
+    Info,
+    /// Two-button prompt asking the user to install an available update.
+    UpdatePrompt {
+        #[allow(dead_code)]
+        tag: String,
+        asset_url: Option<String>,
+    },
+}
+
+impl Popup {
+    pub fn info(title: impl Into<String>, lines: Vec<String>) -> Self {
+        Self {
+            title: title.into(),
+            lines,
+            kind: PopupKind::Info,
+        }
+    }
 }
 
 /// Pending action signalled by a tab for the main loop to execute.
@@ -85,6 +113,47 @@ pub struct Popup {
 pub enum PendingAction {
     Optimize,
     Restructure,
+}
+
+/// Outcome handed back from the optimize worker thread to the UI.
+#[derive(Debug)]
+pub struct OptimizeResult {
+    pub converted: usize,
+    pub total: usize,
+    pub tokens_saved: i64,
+    pub errors: Vec<String>,
+    /// Files whose conversion durably succeeded (manifest written). The UI
+    /// merges these into `optimized_paths` even if the SQLite write below
+    /// failed, so subsequent runs cannot reconvert them.
+    pub converted_paths: Vec<String>,
+    pub aborted: bool,
+}
+
+/// Worker → UI channel messages.
+#[derive(Debug)]
+pub enum OptMsg {
+    Progress {
+        current: usize,
+        total: usize,
+        label: String,
+    },
+    Done(OptimizeResult),
+}
+
+/// Handle to an in-flight optimize job. Presence == "a worker is running"
+/// (used to make OPTIMIZE clicks idempotent).
+pub struct OptimizeJob {
+    pub rx: Receiver<OptMsg>,
+    pub abort: Arc<AtomicBool>,
+    pub total: usize,
+}
+
+impl std::fmt::Debug for OptimizeJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OptimizeJob")
+            .field("total", &self.total)
+            .finish()
+    }
 }
 
 #[allow(dead_code)]
@@ -150,11 +219,28 @@ pub struct App {
 
     // Cached conversion count for efficiency tab
     pub conversion_count: usize,
+
+    // Update checker — populated by background thread, drained on tick
+    pub update_check: crate::updater::SharedCheck,
+    /// If set, the main loop will quit and re-exec this binary on shutdown.
+    pub pending_restart: Option<PathBuf>,
+
+    /// Active optimize worker, if any. None == idle.
+    pub optimize_job: Option<OptimizeJob>,
 }
 
 impl App {
+    /// Construct using a pre-loaded config (preferred — discovery has already run).
+    pub fn with_config(config: Config) -> Self {
+        Self::build(config)
+    }
+
+    #[allow(dead_code)]
     pub fn new() -> Self {
-        let config = Config::load().unwrap_or_default();
+        Self::build(Config::load().unwrap_or_default())
+    }
+
+    fn build(config: Config) -> Self {
         let db = Db::open().ok();
         let total_tokens_saved = db
             .as_ref()
@@ -209,7 +295,11 @@ impl App {
             preview_before: Vec::new(),
             preview_after: Vec::new(),
             conversion_count: 0,
+            update_check: crate::updater::new_state(),
+            pending_restart: None,
+            optimize_job: None,
         };
+        crate::updater::spawn_check(app.update_check.clone());
         app.refresh_scan();
         app.refresh_trees();
         app

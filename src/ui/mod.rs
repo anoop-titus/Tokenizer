@@ -28,27 +28,41 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         ])
         .split(size);
 
-    // Store content area for mouse hit testing
+    // Store content area for mouse hit testing.
     app.click_areas.content_area = chunks[1];
+
+    // Reset per-tab button rects every frame. Each tab's render fn re-sets
+    // its own; anything not re-set this frame won't fire on click.
+    app.click_areas.optimize_button = Rect::default();
+    app.click_areas.restructure_button = Rect::default();
 
     render_tab_bar(frame, app, chunks[0]);
     render_active_tab(frame, app, chunks[1]);
     render_status_bar(frame, app, chunks[2]);
 
     // Popup overlay (rendered last, on top)
-    if let Some(ref popup) = app.popup {
-        render_popup(frame, popup, size);
+    if app.popup.is_some() {
+        render_popup(frame, app, size);
+    } else {
+        // Reset stale click rects so misclicks don't fire.
+        app.click_areas.popup_yes = Rect::default();
+        app.click_areas.popup_no = Rect::default();
     }
 }
 
-fn render_popup(frame: &mut Frame, popup: &crate::app::Popup, area: Rect) {
-    let popup_width = 50u16.min(area.width.saturating_sub(4));
-    let popup_height = (popup.lines.len() as u16 + 4).min(area.height.saturating_sub(4));
+fn render_popup(frame: &mut Frame, app: &mut App, area: Rect) {
+    let popup = app.popup.as_ref().expect("popup checked above").clone();
+    let is_prompt = matches!(popup.kind, crate::app::PopupKind::UpdatePrompt { .. });
+
+    // Reserve room for two button rows when this is a prompt.
+    let extra = if is_prompt { 5 } else { 4 };
+    let popup_width = 60u16.min(area.width.saturating_sub(4));
+    let popup_height =
+        (popup.lines.len() as u16 + extra).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
-    // Clear background
     frame.render_widget(Clear, popup_area);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -60,25 +74,68 @@ fn render_popup(frame: &mut Frame, popup: &crate::app::Popup, area: Rect) {
         )));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  Press any key to close",
-        Style::default().fg(theme::AMBER_DIM),
-    )));
+    if !is_prompt {
+        lines.push(Line::from(Span::styled(
+            "  Press any key to close",
+            Style::default().fg(theme::AMBER_DIM),
+        )));
+    }
+
+    let border_color = if is_prompt {
+        theme::AMBER_BRIGHT
+    } else {
+        theme::CYAN
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::CYAN))
+        .border_style(Style::default().fg(border_color))
         .title(format!("[ {} ]", popup.title))
         .title_style(
             Style::default()
-                .fg(theme::CYAN)
+                .fg(border_color)
                 .add_modifier(Modifier::BOLD),
         )
         .style(Style::default().bg(theme::BG));
 
+    let inner = block.inner(popup_area);
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
+
+    if is_prompt {
+        // Draw two clickable buttons at the bottom of the inner popup area.
+        let btn_h: u16 = 3;
+        let btn_w: u16 = 14u16.min(inner.width / 2);
+        let gap: u16 = 2;
+        let total_w = btn_w * 2 + gap;
+        let btn_y = inner.y + inner.height.saturating_sub(btn_h);
+        let start_x = inner.x + (inner.width.saturating_sub(total_w)) / 2;
+
+        let yes_rect = Rect::new(start_x, btn_y, btn_w, btn_h);
+        let no_rect = Rect::new(start_x + btn_w + gap, btn_y, btn_w, btn_h);
+
+        crate::ui::button::render(
+            frame,
+            yes_rect,
+            "YES (y)",
+            true,
+            crate::ui::button::ButtonIntent::Success,
+        );
+        crate::ui::button::render(
+            frame,
+            no_rect,
+            "NO (n)",
+            false,
+            crate::ui::button::ButtonIntent::Neutral,
+        );
+
+        app.click_areas.popup_yes = yes_rect;
+        app.click_areas.popup_no = no_rect;
+    } else {
+        app.click_areas.popup_yes = Rect::default();
+        app.click_areas.popup_no = Rect::default();
+    }
 }
 
 fn render_tab_bar(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -87,7 +144,7 @@ fn render_tab_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::BORDER))
-        .title("[ TOKENIZER v0.2.0 ]")
+        .title(format!("[ TOKENIZER v{} ]", env!("CARGO_PKG_VERSION")))
         .title_style(
             Style::default()
                 .fg(theme::AMBER)
@@ -191,6 +248,18 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("\u{2502}", Style::default().fg(theme::BORDER)),
         Span::styled(" r:refresh q:quit ", Style::default().fg(theme::AMBER_DIM)),
     ];
+
+    // While an optimize worker is running, expose Esc to abort.
+    if app.optimize_job.is_some() {
+        spans.push(Span::styled("\u{2502}", Style::default().fg(theme::BORDER)));
+        spans.push(Span::styled(
+            " RUNNING — Esc to abort ",
+            Style::default()
+                .fg(theme::BG)
+                .bg(theme::AMBER_BRIGHT)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     // Show settings status if present
     if let Some(ref status) = app.settings_status {

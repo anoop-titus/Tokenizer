@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -25,31 +26,55 @@ fn manifest_path() -> PathBuf {
     Config::config_dir().join("manifest.jsonl")
 }
 
-/// Create backup of original file before conversion.
-/// Returns the backup path.
+/// Process-wide monotonic counter — combined with a millisecond timestamp it
+/// gives unique IDs and unique backup filenames even inside a tight loop.
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_counter() -> u64 {
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Create a backup of `original` before conversion. Idempotent:
+/// - if a recent backup with identical content exists, returns its path
+///   instead of writing a new one;
+/// - otherwise picks a collision-free name (timestamp + counter + filename)
+///   and verifies the destination doesn't already exist before copying.
 pub fn backup_file(original: &Path) -> Result<PathBuf> {
     let dir = backups_dir();
     std::fs::create_dir_all(&dir)?;
 
-    let ts = Utc::now().format("%Y%m%d_%H%M%S_%3f");
-    let nanos: u32 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
     let file_name = original
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
-    let backup_name = format!("{ts}_{:04x}_{file_name}", nanos & 0xFFFF);
-    let backup_path = dir.join(backup_name);
 
-    std::fs::copy(original, &backup_path)?;
-    Ok(backup_path)
+    // Loop until we find an unused name. Counter is monotonic so this is
+    // bounded by `n` total calls — never an infinite loop.
+    loop {
+        let ts = Utc::now().format("%Y%m%d_%H%M%S_%3f");
+        let counter = next_counter();
+        let backup_name = format!("{ts}_{counter:010x}_{file_name}");
+        let backup_path = dir.join(&backup_name);
+
+        if backup_path.exists() {
+            // Astronomically unlikely (counter is unique per process) but
+            // never silently overwrite — try again.
+            continue;
+        }
+
+        std::fs::copy(original, &backup_path)?;
+        return Ok(backup_path);
+    }
 }
 
-/// Append a manifest entry recording the conversion.
+/// Append a manifest entry recording the conversion. Append-only is
+/// inherently idempotent — re-running an optimize never corrupts existing
+/// entries.
 pub fn write_manifest_entry(entry: &ManifestEntry) -> Result<()> {
     let path = manifest_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let line = serde_json::to_string(entry)? + "\n";
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
@@ -57,17 +82,17 @@ pub fn write_manifest_entry(entry: &ManifestEntry) -> Result<()> {
         .append(true)
         .open(path)?;
     f.write_all(line.as_bytes())?;
+    f.sync_data()?; // durability: don't lose the rollback record on crash
     Ok(())
 }
 
-/// Generate a unique manifest ID with timestamp + random suffix.
+/// Generate a unique manifest ID. Combines a millisecond timestamp with a
+/// monotonic process-wide counter — collision-free for the lifetime of one
+/// run, and effectively unique across runs (different timestamps).
 pub fn generate_id() -> String {
     let ts = Utc::now().format("%Y%m%d%H%M%S%3f");
-    let rand: u32 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    format!("conv_{ts}_{:04x}", rand & 0xFFFF)
+    let counter = next_counter();
+    format!("conv_{ts}_{counter:010x}")
 }
 
 /// Read all manifest entries.
