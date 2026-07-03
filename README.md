@@ -1,3 +1,7 @@
+> ⚠️ **Superseded by [Cloptimizer](https://github.com/anoop-titus/Cloptimizer).**
+> Tokenizer's token-optimization has been merged with **process-police** into
+> **Cloptimizer** — one Claude Code hygiene TUI. New work happens there.
+
 # Tokenizer
 
 Token-optimization TUI for Claude Code's `~/.claude` directory.
